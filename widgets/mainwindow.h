@@ -75,6 +75,8 @@ namespace Ui {
 }
 
 class QProcessEnvironment;
+class QJsonObject;
+class Ft8Sidecar;
 class QSharedMemory;
 class QSplashScreen;
 class QSettings;
@@ -802,6 +804,8 @@ private:
   QFutureWatcher<QString> m_saveWAVWatcher;
 
   NonInheritingProcess proc_jt9;
+  QScopedPointer<Ft8Sidecar> m_ft8Sidecar;     // external FT8 decoder (WSJTX_FT8_DECODER)
+  QList<QByteArray> m_injectedDecoderLines;     // sidecar output, parsed as jt9 stdout
   NonInheritingProcess p1;
   NonInheritingProcess p3;
 
@@ -1062,6 +1066,11 @@ private:
   void writeFoxQSO (QString const& msg);
   void update_foxLogWindow_rate();
   void to_jt9(qint32 n, qint32 istart, qint32 idone);
+  void startFt8Sidecar ();
+  bool useFt8Sidecar () const;
+  bool sendFt8SidecarRequest ();
+  QJsonObject ft8SidecarRequest () const;
+  bool nextDecoderLine (QByteArray& line);
   bool is77BitMode () const;
   void cease_auto_Tx_after_QSO ();
   Q_SLOT void ARRL_Digi_Display();

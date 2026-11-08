@@ -37,6 +37,8 @@
 #include <QStandardPaths>
 #include <QDir>
 #include <QDebug>
+#include <QJsonArray>
+#include <QJsonObject>
 #include <QtConcurrent/QtConcurrentRun>
 #include <QProgressDialog>
 #include <QHostInfo>
@@ -111,6 +113,7 @@
 #include "widgets/QSYMessageCreator.h"
 #include "widgets/qsymonitor.h"
 #include "Network/eqsl.h"
+#include "Decoder/Ft8Sidecar.hpp"
 
 #define FCL fortran_charlen_t
 
@@ -1137,6 +1140,7 @@ MainWindow::MainWindow(QDir const& temp_directory, bool multiple,
   proc_jt9.setProcessEnvironment (new_env);
   proc_jt9.start(QDir::toNativeSeparators (m_appDir) + QDir::separator () +
           "jt9", jt9_args, QIODevice::ReadWrite | QIODevice::Unbuffered);
+  startFt8Sidecar ();
 
   auto fname {QDir::toNativeSeparators(m_config.writeable_data_dir ().absoluteFilePath ("wsjtx_wisdom.dat"))};
   fftwf_import_wisdom_from_filename (fname.toLocal8Bit ());
@@ -4525,6 +4529,7 @@ void MainWindow::closeEvent(QCloseEvent * e)
   int irow=-99;
   plotsave_(&sw,&nw,&nh,&irow);
   to_jt9(m_ihsym,999,-1);          //Tell jt9 to terminate
+  if (m_ft8Sidecar) m_ft8Sidecar->stop ();
   if (!proc_jt9.waitForFinished(1000)) proc_jt9.close();
   mem_jt9->detach();
   Q_EMIT finished ();
@@ -5634,6 +5639,8 @@ void MainWindow::decode()                                       //decode()
         watcher3.setFuture (QtConcurrent::run (std::bind (fast_decode_, &d2b[0],
             &narg[0],&m_TRperiod, &m_msg[0][0], dec_data.params.mycall,
             dec_data.params.hiscall, (FCL)8000, (FCL)12, (FCL)12)));
+      } else if (useFt8Sidecar () && sendFt8SidecarRequest ()) {
+        decodeBusy(true);                     //External FT8 decoder, see startFt8Sidecar()
       } else {
         mem_jt9->lock ();
         memcpy(to, from, qMin(mem_jt9->size(), size));
@@ -5702,6 +5709,144 @@ void MainWindow::to_jt9(qint32 n, qint32 istart, qint32 idone)
       if(idone>=0)  dd->ipc[2]=idone;
       mem_jt9->unlock ();
     }
+}
+
+// ---------------------------------------------------------------- FT8 sidecar
+//
+// If WSJTX_FT8_DECODER is set, FT8 decodes go to that long-running
+// external process instead of jt9 (see Decoder/Ft8Sidecar.hpp and
+// doc/ft8-sidecar-protocol.md).  Its output is converted to jt9 stdout
+// lines and fed through readFromStdout(), so filtering, ALL.TXT, UDP,
+// PSK Reporter, etc. behave exactly as with jt9.  jt9 still runs and
+// handles every other mode; it also takes over FT8 again if the
+// sidecar fails, and for Fox and SuperFox operation.
+
+void MainWindow::startFt8Sidecar ()
+{
+  auto command = m_env.value (Ft8Sidecar::env_var).trimmed ();
+  if (command.isEmpty ()) return;
+
+  QProcessEnvironment env {m_env};
+  env.insert ("WSJTX_TEMP_DIR", QDir::toNativeSeparators (m_config.temp_dir ().absolutePath ()));
+  env.insert ("WSJTX_DATA_DIR", QDir::toNativeSeparators (m_config.writeable_data_dir ().absolutePath ()));
+  env.insert ("WSJTX_SHARE_DIR", QDir::toNativeSeparators (m_config.data_dir ().absolutePath ()));
+  m_ft8Sidecar.reset (new Ft8Sidecar {command, env});
+
+  connect (m_ft8Sidecar.data (), &Ft8Sidecar::decoded, this, [this] (QByteArray const& line) {
+      m_injectedDecoderLines << line + '\n';
+      readFromStdout ();
+    });
+  connect (m_ft8Sidecar.data (), &Ft8Sidecar::finished, this, [this] (int ndecodes) {
+      // Same shape as jt9: '<DecodeFinished>',2i4,i9
+      m_injectedDecoderLines << QString::asprintf ("<DecodeFinished>%4d%4d%9d\n", 0, ndecodes, 0).toLatin1 ();
+      readFromStdout ();
+    });
+  connect (m_ft8Sidecar.data (), &Ft8Sidecar::failed, this, [this] (QString const& reason) {
+      qWarning ().noquote () << reason << "- FT8 decoding falls back to jt9";
+      showStatusMessage (tr ("External FT8 decoder stopped; using built-in decoder"));
+    });
+
+  m_ft8Sidecar->start (QJsonObject {
+      {"app", QApplication::applicationName ()},
+      {"version", version ()},
+      {"temp_dir", QDir::toNativeSeparators (m_config.temp_dir ().absolutePath ())},
+      {"data_dir", QDir::toNativeSeparators (m_config.writeable_data_dir ().absolutePath ())},
+      {"share_dir", QDir::toNativeSeparators (m_config.data_dir ().absolutePath ())},
+    });
+}
+
+bool MainWindow::useFt8Sidecar () const
+{
+  return m_mode == "FT8"
+    && m_ft8Sidecar && m_ft8Sidecar->available ()
+    && SpecOp::FOX != m_specOp          // Fox caller tracking lives in jt9
+    && !dec_data.params.b_superfox;     // SuperFox has its own decoder
+}
+
+bool MainWindow::sendFt8SidecarRequest ()
+{
+  auto const& p = dec_data.params;
+  int const period_samples = int (m_TRperiod * RX_SAMPLE_RATE);
+  int valid = p.ndiskdat ? p.kin : m_ihsym * m_nsps / 2;
+  valid = qBound (0, valid, qMin (period_samples, int (NTMAX * RX_SAMPLE_RATE)));
+  // A re-decode (newdat==0) refers to the previous period's audio, which
+  // jt9 keeps in its own copy; d2 may already hold the next period, so
+  // send no audio and let the decoder re-use what it was sent last.
+  if (!p.newdat) valid = 0;
+  return m_ft8Sidecar->decode (ft8SidecarRequest (), p.nutc, dec_data.d2, valid,
+                               qMax (5000, int (1000 * m_TRperiod)));
+}
+
+QJsonObject MainWindow::ft8SidecarRequest () const
+{
+  auto const& p = dec_data.params;
+  auto str = [] (char const * c, int n) {
+    return QString::fromLatin1 (c, int (qstrnlen (c, n))).trimmed ();
+  };
+  QJsonArray listutc;
+  for (int v : p.listutc) listutc << v;
+
+  // Every field of dec_data.params, under its C/Fortran name
+  QJsonObject params {
+    {"nutc", p.nutc}, {"ndiskdat", p.ndiskdat}, {"ntrperiod", p.ntrperiod},
+    {"nQSOProgress", p.nQSOProgress}, {"nfqso", p.nfqso}, {"nftx", p.nftx},
+    {"newdat", p.newdat}, {"npts8", p.npts8}, {"nfa", p.nfa}, {"nfSplit", p.nfSplit},
+    {"nfb", p.nfb}, {"ntol", p.ntol}, {"kin", p.kin}, {"nzhsym", p.nzhsym},
+    {"nsubmode", p.nsubmode}, {"nagain", p.nagain}, {"ndepth", p.ndepth},
+    {"lft8apon", p.lft8apon}, {"lapcqonly", p.lapcqonly}, {"ljt65apon", p.ljt65apon},
+    {"napwid", p.napwid}, {"ntxmode", p.ntxmode}, {"nmode", p.nmode}, {"minw", p.minw},
+    {"nclearave", p.nclearave}, {"minSync", p.minSync}, {"emedelay", p.emedelay},
+    {"dttol", p.dttol}, {"nlist", p.nlist}, {"listutc", listutc}, {"n2pass", p.n2pass},
+    {"nranera", p.nranera}, {"naggressive", p.naggressive}, {"nrobust", p.nrobust},
+    {"nexp_decode", p.nexp_decode}, {"max_drift", p.max_drift},
+    {"datetime", str (p.datetime, sizeof p.datetime)},
+    {"mycall", str (p.mycall, sizeof p.mycall)}, {"mygrid", str (p.mygrid, sizeof p.mygrid)},
+    {"hiscall", str (p.hiscall, sizeof p.hiscall)}, {"hisgrid", str (p.hisgrid, sizeof p.hisgrid)},
+    {"b_even_seq", p.b_even_seq}, {"b_superfox", p.b_superfox}, {"yymmdd", p.yymmdd},
+    {"mybcall", str (p.mybcall, sizeof p.mybcall)}, {"hisbcall", str (p.hisbcall, sizeof p.hisbcall)},
+    {"ncandthin", p.ncandthin}, {"ndtcenter", p.ndtcenter}, {"nft8cycles", p.nft8cycles},
+    {"ntrials10", p.ntrials10}, {"ntrialsrxf10", p.ntrialsrxf10},
+    {"nharmonicsdepth", p.nharmonicsdepth}, {"ntopfreq65", p.ntopfreq65},
+    {"nprepass", p.nprepass}, {"nsdecatt", p.nsdecatt}, {"nlasttx", p.nlasttx},
+    {"ndelay", p.ndelay}, {"nmt", p.nmt}, {"nft8rxfsens", p.nft8rxfsens},
+    {"nft4depth", p.nft4depth}, {"nsecbandchanged", p.nsecbandchanged},
+    {"nagainfil", p.nagainfil}, {"nstophint", p.nstophint}, {"nhint", p.nhint},
+    {"fmaskact", p.fmaskact}, {"lmultift8", p.lmultift8}, {"lft8lowth", p.lft8lowth},
+    {"lft8subpass", p.lft8subpass}, {"ltxing", p.ltxing}, {"lhideft8dupes", p.lhideft8dupes},
+    {"lhound", p.lhound}, {"lcommonft8b", p.lcommonft8b}, {"lmycallstd", p.lmycallstd},
+    {"lhiscallstd", p.lhiscallstd}, {"lapmyc", p.lapmyc}, {"lmodechanged", p.lmodechanged},
+    {"lbandchanged", p.lbandchanged}, {"lenabledxcsearch", p.lenabledxcsearch},
+    {"lwidedxcsearch", p.lwidedxcsearch}, {"lmultinst", p.lmultinst},
+    {"lskiptx1", p.lskiptx1}, {"ndecoderstart", p.ndecoderstart},
+  };
+
+  // A few normalised conveniences on top of the raw parameters
+  return QJsonObject {
+    {"mode", m_mode},
+    {"utc", p.nutc},
+    {"pass", p.nzhsym},
+    {"final", p.ndiskdat || p.nzhsym == m_hsymStop},
+    {"disk", bool (p.ndiskdat)},
+    {"period_start", p.ndiskdat ? QString {} : m_dateTimeSeqStart.toString (Qt::ISODateWithMs)},
+    {"dial_freq", double (m_freqNominal)},
+    {"special_op", int (m_specOp)},
+    {"params", params},
+  };
+}
+
+bool MainWindow::nextDecoderLine (QByteArray& line)
+{
+  if (!m_injectedDecoderLines.isEmpty ())
+    {
+      line = m_injectedDecoderLines.takeFirst ();
+      return true;
+    }
+  if (proc_jt9.canReadLine ())
+    {
+      line = proc_jt9.readLine ();
+      return true;
+    }
+  return false;
 }
 
 void MainWindow::decodeDone ()
@@ -6140,8 +6285,9 @@ void MainWindow::readFromStdout()                             //readFromStdout
     bDisplayPoints=(m_mode=="FT4" or m_mode=="FT8") and
       (m_specOp==SpecOp::ARRL_DIGI or m_ActiveStationsWidget->isVisible());
   }
-  while(proc_jt9.canReadLine()) {
-    auto line_read = proc_jt9.readLine ();
+  QByteArray next_line;
+  while(nextDecoderLine(next_line)) {      // jt9 stdout, or FT8 sidecar output
+    auto line_read = next_line;
 
     QString the_line = QString(line_read);
     if(ui->actionEnable_QSY_Popups->isChecked() || m_qsymonitorWidget) showQSYMessage(the_line);

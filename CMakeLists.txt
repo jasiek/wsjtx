@@ -322,6 +322,7 @@ set (wsjtx_CXXSRCS
   widgets/logqso.cpp
   widgets/displaytext.cpp
   Decoder/decodedtext.cpp
+  Decoder/Ft8Sidecar.cpp
   getfile.cpp
   Audio/soundout.cpp
   Audio/soundin.cpp
